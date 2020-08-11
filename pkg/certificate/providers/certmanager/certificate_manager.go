@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"strconv"
 	"time"
 
 	cmapi "github.com/jetstack/cert-manager/pkg/apis/certmanager/v1beta1"
@@ -23,12 +24,6 @@ import (
 func (cm *CertManager) IssueCertificate(cn certificate.CommonName, validityPeriod *time.Duration) (certificate.Certificater, error) {
 	start := time.Now()
 
-	// Attempt to grab certificate from cache.
-	if cert := cm.getFromCache(cn); cert != nil {
-		return cert, nil
-	}
-
-	// Cache miss/needs rotation so issue new certificate.
 	cert, err := cm.issue(cn, validityPeriod)
 	if err != nil {
 		return nil, err
@@ -41,24 +36,12 @@ func (cm *CertManager) IssueCertificate(cn certificate.CommonName, validityPerio
 
 // GetCertificate returns a certificate given its Common Name (CN)
 func (cm *CertManager) GetCertificate(cn certificate.CommonName) (certificate.Certificater, error) {
-	if cert := cm.getFromCache(cn); cert != nil {
-		return cert, nil
+	cert, _, err := cm.fetchFromCertificateRequest(cn)
+	if err != nil || cert == nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("failed to find certificate with CN=%s", cn)
-}
 
-func (cm *CertManager) getFromCache(cn certificate.CommonName) certificate.Certificater {
-	cm.cacheLock.RLock()
-	defer cm.cacheLock.RUnlock()
-	if cert, exists := cm.cache[cn]; exists {
-		log.Trace().Msgf("Certificate found in cache CN=%s", cn)
-		if rotor.ShouldRotate(cert) {
-			log.Trace().Msgf("Certificate found in cache but has expired CN=%s", cn)
-			return nil
-		}
-		return cert
-	}
-	return nil
+	return cert, nil
 }
 
 // RotateCertificate implements certificate.Manager and rotates an existing
@@ -74,9 +57,6 @@ func (cm *CertManager) RotateCertificate(cn certificate.CommonName) (certificate
 		return cert, err
 	}
 
-	cm.cacheLock.Lock()
-	cm.cache[cn] = cert
-	cm.cacheLock.Unlock()
 	cm.announcements <- nil
 
 	log.Info().Msgf("Rotating certificate CN=%s took %+v", cn, time.Since(start))
@@ -91,13 +71,7 @@ func (cm *CertManager) GetRootCertificate() (certificate.Certificater, error) {
 
 // ListCertificates lists all certificates issued
 func (cm *CertManager) ListCertificates() ([]certificate.Certificater, error) {
-	var certs []certificate.Certificater
-	cm.cacheLock.RLock()
-	for _, cert := range cm.cache {
-		certs = append(certs, cert)
-	}
-	cm.cacheLock.RUnlock()
-	return certs, nil
+	return cm.fetchCertificates()
 }
 
 // GetAnnouncementsChannel returns a channel, which is used to announce when
@@ -106,30 +80,14 @@ func (cm *CertManager) GetAnnouncementsChannel() <-chan interface{} {
 	return cm.announcements
 }
 
-// certificaterFromCertificateRequest will construct a certificate.Certificater
-// from a give CertificateRequest and private key.
-func (cm *CertManager) certificaterFromCertificateRequest(cr *cmapi.CertificateRequest, privateKey []byte) (certificate.Certificater, error) {
-	if cr == nil {
-		return nil, nil
-	}
-
-	cert, err := certificate.DecodePEMCertificate(cr.Status.Certificate)
+// issue will request a new signed certificate from the configured cert-manager
+// issuer.
+func (cm *CertManager) issue(cn certificate.CommonName, validityPeriod *time.Duration) (certificate.Certificater, error) {
+	oldCR, revision, err := cm.fetchFromCertificateRequest(cn)
 	if err != nil {
 		return nil, err
 	}
 
-	return Certificate{
-		commonName: certificate.CommonName(cert.Subject.CommonName),
-		expiration: cert.NotAfter,
-		certChain:  cr.Status.Certificate,
-		privateKey: privateKey,
-		issuingCA:  cm.ca.GetIssuingCA(),
-	}, nil
-}
-
-// issue will request a new signed certificate from the configured cert-manager
-// issuer.
-func (cm *CertManager) issue(cn certificate.CommonName, validityPeriod *time.Duration) (certificate.Certificater, error) {
 	var duration *metav1.Duration
 	if validityPeriod != nil {
 		duration = &metav1.Duration{
@@ -175,6 +133,13 @@ func (cm *CertManager) issue(cn certificate.CommonName, validityPeriod *time.Dur
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "osm-",
 			Namespace:    cm.namespace,
+			Labels: map[string]string{
+				CertificateRequestCommonNameLabelKey: cn.String(),
+				CertificateRequestManagedLabelKey:    "true",
+			},
+			Annotations: map[string]string{
+				CertificateRequestRevisionAnnotationKey: strconv.Itoa(revision + 1),
+			},
 		},
 		Spec: cmapi.CertificateRequestSpec{
 			Duration: duration,
@@ -205,15 +170,11 @@ func (cm *CertManager) issue(cn certificate.CommonName, validityPeriod *time.Dur
 		return nil, err
 	}
 
-	defer func() {
-		if err := cm.client.Delete(context.TODO(), cr.Name, metav1.DeleteOptions{}); err != nil {
-			log.Error().Err(err).Msgf("failed to delete CertificateRequest %s/%s", cm.namespace, cr.Name)
+	if oldCR != nil && len(oldCR.certificateRequestName) > 0 {
+		if err := cm.client.Delete(context.TODO(), oldCR.certificateRequestName, metav1.DeleteOptions{}); err != nil {
+			log.Error().Err(err).Msgf("failed to delete old CertificateRequest %s/%s", cm.namespace, oldCR.certificateRequestName)
 		}
-	}()
-
-	cm.cacheLock.Lock()
-	defer cm.cacheLock.Unlock()
-	cm.cache[cert.GetCommonName()] = cert
+	}
 
 	return cert, nil
 }
@@ -230,12 +191,15 @@ func NewCertManager(
 	informerFactory := cminformers.NewSharedInformerFactory(client, time.Second*30)
 	crLister := informerFactory.Certmanager().V1beta1().CertificateRequests().Lister().CertificateRequests(namespace)
 
+	log.Info().Msg("Syncing cert-manager CertificateRequest resource")
+
 	// TODO: pass through graceful shutdown
-	informerFactory.Start(make(chan struct{}))
+	stopCh := make(chan struct{})
+	informerFactory.Start(stopCh)
+	informerFactory.WaitForCacheSync(stopCh)
 
 	cm := &CertManager{
 		ca:             ca,
-		cache:          make(map[certificate.CommonName]certificate.Certificater),
 		announcements:  make(chan interface{}),
 		namespace:      namespace,
 		client:         client.CertmanagerV1beta1().CertificateRequests(namespace),

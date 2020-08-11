@@ -1,9 +1,9 @@
 package certmanager
 
 import (
-	"sync"
 	"time"
 
+	cmapi "github.com/jetstack/cert-manager/pkg/apis/certmanager/v1beta1"
 	cmmeta "github.com/jetstack/cert-manager/pkg/apis/meta/v1"
 	cmclient "github.com/jetstack/cert-manager/pkg/client/clientset/versioned/typed/certmanager/v1beta1"
 	cmlisters "github.com/jetstack/cert-manager/pkg/client/listers/certmanager/v1beta1"
@@ -20,6 +20,13 @@ const (
 	// checkCertificateExpirationInterval is the interval to check wether a
 	// certificate is close to expiration and needs renewal.
 	checkCertificateExpirationInterval = 5 * time.Second
+
+	// Label for CommonName of Certificate Request used for listing
+	CertificateRequestManagedLabelKey    = "openservicemesh.io/managed"
+	CertificateRequestCommonNameLabelKey = "openservicemesh.io/common-name"
+
+	// Revision denotes the "revision" of certificate for a given identity
+	CertificateRequestRevisionAnnotationKey = "openservicemesh.io/revision"
 )
 
 var (
@@ -34,11 +41,6 @@ type CertManager struct {
 	// The Certificate Authority root certificate to be used by this certificate
 	// manager.
 	ca certificate.Certificater
-
-	// cache holds a local cache of issued certificates as
-	// certificate.Certificaters
-	cache     map[certificate.CommonName]certificate.Certificater
-	cacheLock sync.RWMutex
 
 	// The channel announcing to the rest of the system when a certificate has
 	// changed.
@@ -73,4 +75,14 @@ type Certificate struct {
 
 	// Certificate authority signing this certificate.
 	issuingCA pem.RootCertificate
+
+	certificateRequestName string
+}
+
+// certificateRequestRevisionPair is used to hold a CertificateRequest and
+// revision pair to construct a map containing the latest certificate requests
+// made.
+type certificateRequestRevisionPair struct {
+	revision int
+	cr       *cmapi.CertificateRequest
 }

@@ -20,7 +20,7 @@ import (
 )
 
 var _ = Describe("Test cert-manager Certificate Manager", func() {
-	Context("Test Getting a certificate from the cache", func() {
+	Context("Test Getting a certificate from the API", func() {
 		log := logger.New("cert-manager-test")
 		validity := 1 * time.Hour
 		rootCertFilePEM := "../../sample_certificate.pem"
@@ -66,6 +66,13 @@ var _ = Describe("Test cert-manager Certificate Manager", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "osm-123",
 				Namespace: "osm-system",
+				Labels: map[string]string{
+					CertificateRequestCommonNameLabelKey: cn.String(),
+					CertificateRequestManagedLabelKey:    "true",
+				},
+				Annotations: map[string]string{
+					CertificateRequestRevisionAnnotationKey: "0",
+				},
 			},
 		}
 		crReady := crNotReady.DeepCopy()
@@ -97,15 +104,19 @@ var _ = Describe("Test cert-manager Certificate Manager", func() {
 		})
 
 		cm, newCertError := NewCertManager(rootCertificator, fakeClient, "osm-system", validity, cmmeta.ObjectReference{Name: "osm-ca"})
-		It("should get an issued certificate from the cache", func() {
+		It("should get an issued certificate from the API", func() {
 			Expect(newCertError).ToNot(HaveOccurred())
+
 			cert, issueCertificateError := cm.IssueCertificate(cn, &validity)
 			Expect(issueCertificateError).ToNot(HaveOccurred())
 			Expect(cert.GetCommonName()).To(Equal(cn))
 
-			cachedCert, getCertificateError := cm.GetCertificate(cn)
+			newCert := cert.(*Certificate)
+			newCert.privateKey = nil
+
+			issuedCert, getCertificateError := cm.GetCertificate(cn)
 			Expect(getCertificateError).ToNot(HaveOccurred())
-			Expect(cachedCert).To(Equal(cert))
+			Expect(issuedCert).To(Equal(newCert))
 		})
 	})
 })
