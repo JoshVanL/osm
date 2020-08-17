@@ -1,6 +1,7 @@
 package certmanager
 
 import (
+	"errors"
 	"time"
 
 	cmapi "github.com/jetstack/cert-manager/pkg/apis/certmanager/v1beta1"
@@ -30,7 +31,8 @@ const (
 )
 
 var (
-	log = logger.New("cert-manager")
+	log                          = logger.New("cert-manager")
+	errNoCertificateRequestFound = errors.New("no CertificateRequests found match CN")
 )
 
 // CertManager implements certificate.Manager

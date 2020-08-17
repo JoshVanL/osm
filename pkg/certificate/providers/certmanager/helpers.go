@@ -2,6 +2,7 @@ package certmanager
 
 import (
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"time"
 
@@ -70,14 +71,22 @@ func (cm *CertManager) fetchCertificates() ([]certificate.Certificater, error) {
 }
 
 func (cm *CertManager) fetchFromCertificateRequest(cn certificate.CommonName) (*Certificate, int, error) {
+	cnHash, err := hashCommonName(cn)
+	if err != nil {
+		return nil, -1, err
+	}
+
 	crs, err := cm.crLister.List(labels.SelectorFromSet(
 		map[string]string{
 			CertificateRequestManagedLabelKey:    "true",
-			CertificateRequestCommonNameLabelKey: cn.String(),
+			CertificateRequestCommonNameLabelKey: cnHash,
 		},
 	))
-	if err != nil || len(crs) == 0 {
+	if err != nil {
 		return nil, -1, err
+	}
+	if len(crs) == 0 {
+		return nil, -1, errNoCertificateRequestFound
 	}
 
 	var (
@@ -85,10 +94,18 @@ func (cm *CertManager) fetchFromCertificateRequest(cn certificate.CommonName) (*
 		latestRevision int
 	)
 	for i, cr := range crs {
+		if !certificateRequestIsReady(cr) {
+			continue
+		}
+
 		if nextRevision, err := strconv.Atoi(cr.Annotations[CertificateRequestRevisionAnnotationKey]); err == nil &&
 			nextRevision >= latestRevision {
 			latestCR = crs[i]
 		}
+	}
+
+	if latestCR == nil {
+		return nil, -1, fmt.Errorf("no ready certificates for CN=%s", cn)
 	}
 
 	cert, err := cm.certificaterFromCertificateRequest(latestCR, nil)
@@ -175,4 +192,15 @@ func certificateRequestIsReady(cr *cmapi.CertificateRequest) bool {
 	}
 
 	return false
+}
+
+// hashCommonName is used to hash a common name so that it fits into the 63
+// character limit of label values.
+func hashCommonName(cn certificate.CommonName) (string, error) {
+	hash := fnv.New32()
+	if _, err := hash.Write([]byte(cn.String())); err != nil {
+		return "", fmt.Errorf("failed to calculate common name hash %q: %s", cn, err)
+	}
+
+	return fmt.Sprintf("%d", hash.Sum32()), nil
 }

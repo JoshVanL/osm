@@ -37,11 +37,7 @@ func (cm *CertManager) IssueCertificate(cn certificate.CommonName, validityPerio
 // GetCertificate returns a certificate given its Common Name (CN)
 func (cm *CertManager) GetCertificate(cn certificate.CommonName) (certificate.Certificater, error) {
 	cert, _, err := cm.fetchFromCertificateRequest(cn)
-	if err != nil || cert == nil {
-		return nil, err
-	}
-
-	return cert, nil
+	return cert, err
 }
 
 // RotateCertificate implements certificate.Manager and rotates an existing
@@ -84,7 +80,7 @@ func (cm *CertManager) GetAnnouncementsChannel() <-chan interface{} {
 // issuer.
 func (cm *CertManager) issue(cn certificate.CommonName, validityPeriod *time.Duration) (certificate.Certificater, error) {
 	oldCR, revision, err := cm.fetchFromCertificateRequest(cn)
-	if err != nil {
+	if err != nil && err != errNoCertificateRequestFound {
 		return nil, err
 	}
 
@@ -129,12 +125,17 @@ func (cm *CertManager) issue(cn certificate.CommonName, validityPeriod *time.Dur
 			cn, err)
 	}
 
+	cnHash, err := hashCommonName(cn)
+	if err != nil {
+		return nil, err
+	}
+
 	cr := &cmapi.CertificateRequest{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "osm-",
 			Namespace:    cm.namespace,
 			Labels: map[string]string{
-				CertificateRequestCommonNameLabelKey: cn.String(),
+				CertificateRequestCommonNameLabelKey: cnHash,
 				CertificateRequestManagedLabelKey:    "true",
 			},
 			Annotations: map[string]string{
